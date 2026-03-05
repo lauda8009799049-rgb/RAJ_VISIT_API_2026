@@ -1,154 +1,185 @@
+
 from flask import Flask, request, jsonify
 import json
 import binascii
+import asyncio
+import itertools
+import aiohttp
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
-import aiohttp
-import asyncio
+from google.protobuf.json_format import MessageToJson
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-from google.protobuf.json_format import MessageToJson
+
 import uid_generator_pb2
 import like_count_pb2
 
 app = Flask(__name__)
 
+MAX_VISITS = 10000   # ULTRA POWERFUL LIMIT
+
+
 def load_tokens(region):
     try:
         if region == "IND":
-            with open("token_ind.json", "r") as f:
-                tokens = json.load(f)
-        elif region in {"BR", "US", "SAC", "NA"}:
-            with open("token_br.json", "r") as f:
-                tokens = json.load(f)
+            with open("token_ind.json") as f:
+                return json.load(f)
+        elif region in {"BR","US","SAC","NA"}:
+            with open("token_br.json") as f:
+                return json.load(f)
         else:
-            with open("token_bd.json", "r") as f:
-                tokens = json.load(f)
-        return tokens
+            with open("token_bd.json") as f:
+                return json.load(f)
     except:
-        return None
+        return []
+
 
 def encrypt_message(plaintext):
-    try:
-        key = b'Yg&tc%DEuh6%Zc^8'
-        iv = b'6oyZDr22E3ychjM%'
-        cipher = AES.new(key, AES.MODE_CBC, iv)
-        padded_message = pad(plaintext, AES.block_size)
-        encrypted_message = cipher.encrypt(padded_message)
-        return binascii.hexlify(encrypted_message).decode('utf-8')
-    except:
-        return None
+    key = b'Yg&tc%DEuh6%Zc^8'
+    iv = b'6oyZDr22E3ychjM%'
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    padded_message = pad(plaintext, AES.block_size)
+    encrypted_message = cipher.encrypt(padded_message)
+    return binascii.hexlify(encrypted_message).decode()
+
 
 def create_protobuf(uid):
-    try:
-        message = uid_generator_pb2.uid_generator()
-        message.saturn_ = int(uid)
-        message.garena = 1
-        return message.SerializeToString()
-    except:
-        return None
+    message = uid_generator_pb2.uid_generator()
+    message.saturn_ = int(uid)
+    message.garena = 1
+    return message.SerializeToString()
+
 
 def enc(uid):
     protobuf_data = create_protobuf(uid)
-    if protobuf_data is None:
-        return None
-    encrypted_uid = encrypt_message(protobuf_data)
-    return encrypted_uid
+    return encrypt_message(protobuf_data)
+
 
 async def make_request_async(encrypt, region, token, session):
     try:
         if region == "IND":
             url = "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
-        elif region in {"BR", "US", "SAC", "NA"}:
+        elif region in {"BR","US","SAC","NA"}:
             url = "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
         else:
             url = "https://clientbp.ggblueshark.com/GetPlayerPersonalShow"
 
-        edata = bytes.fromhex(encrypt)
         headers = {
-            'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-            'Connection': "Keep-Alive",
-            'Accept-Encoding': "gzip",
-            'Authorization': f"Bearer {token}",
-            'Content-Type': "application/x-www-form-urlencoded",
-            'Expect': "100-continue",
-            'X-Unity-Version': "2018.4.11f1",
-            'X-GA': "v1 1",
-            'ReleaseVersion': "OB52"
+            "User-Agent": "Dalvik/2.1.0 (Linux; Android 9)",
+            "Connection": "Keep-Alive",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-Unity-Version": "2018.4.11f1",
+            "ReleaseVersion": "OB52"
         }
+
+        edata = bytes.fromhex(encrypt)
 
         async with session.post(url, data=edata, headers=headers, ssl=False, timeout=5) as response:
             if response.status != 200:
                 return None
+
             hex_data = await response.read()
             binary = bytes.fromhex(hex_data.hex())
-            decode = decode_protobuf(binary)
-            return decode
+            items = like_count_pb2.Info()
+            items.ParseFromString(binary)
+            return items
+
     except:
         return None
 
-def decode_protobuf(binary):
-    try:
-        items = like_count_pb2.Info()
-        items.ParseFromString(binary)
-        return items
-    except:
-        return None
 
-@app.route('/visit', methods=['GET'])
+@app.route("/visit")
 async def visit():
     target_uid = request.args.get("uid")
-    region = request.args.get("region", "").upper()
+    region = request.args.get("region","").upper()
+
     if not target_uid or not region:
-        return jsonify({"error": "Target UID and region are required"}), 400
+        return jsonify({"error":"uid and region required"}),400
+
+    tokens = load_tokens(region)
+
+    if not tokens:
+        return jsonify({"error":"no tokens loaded"}),500
+
+    encrypted_uid = enc(target_uid)
+
+    expanded_tokens = list(itertools.islice(itertools.cycle(tokens), MAX_VISITS))
+
+    success = 0
+    fail = 0
+    player_name = None
+    player_uid = None
+
+    connector = aiohttp.TCPConnector(limit=2000)
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+
+        tasks = [
+            make_request_async(encrypted_uid, region, t["token"], session)
+            for t in expanded_tokens
+        ]
+
+        results = await asyncio.gather(*tasks)
+
+    for r in results:
+        if r:
+            success += 1
+            if player_name is None:
+                js = MessageToJson(r)
+                data = json.loads(js)
+                player_name = data.get("AccountInfo",{}).get("PlayerNickname","")
+                player_uid = data.get("AccountInfo",{}).get("UID","")
+        else:
+            fail += 1
+
+    return jsonify({
+        "RequestedVisits": MAX_VISITS,
+        "SuccessfulVisits": success,
+        "FailedVisits": fail,
+        "PlayerNickname": player_name,
+        "UID": player_uid
+    })
+
+
+# OPTIONAL TOKEN REFRESH ENDPOINT
+import httpx
+
+LOGIN_API = "https://loginbp.ggblueshark.com/MajorLogin"
+
+@app.route("/refresh")
+async def refresh():
 
     try:
-        tokens = load_tokens(region)
-        if tokens is None:
-            raise Exception("Failed to load tokens.")
-        
-        encrypted_target_uid = enc(target_uid)
-        if encrypted_target_uid is None:
-            raise Exception("Encryption of target UID failed.")
-        
-        total_visits = len(tokens)
-        success_count = 0
-        failed_count = 0
-        player_name = None
-        player_uid = None
+        with open("accounts.json") as f:
+            accounts = json.load(f)
+    except:
+        return {"error":"accounts.json missing"}
 
-        async with aiohttp.ClientSession() as session:
-            tasks = [
-                make_request_async(encrypted_target_uid, region, token['token'], session)
-                for token in tokens
-            ]
-            results = await asyncio.gather(*tasks)
+    tokens = []
 
-        for info in results:
-            if info is not None:
-                if player_name is None and player_uid is None:
-                    jsone = MessageToJson(info)
-                    data_info = json.loads(jsone)
-                    player_name = str(data_info.get('AccountInfo', {}).get('PlayerNickname', ''))
-                    player_uid = int(data_info.get('AccountInfo', {}).get('UID', 0))
-                success_count += 1
-            else:
-                failed_count += 1
+    async with httpx.AsyncClient() as client:
 
-        summary = {
-            "TotalVisits": total_visits,
-            "SuccessfulVisits": success_count,
-            "FailedVisits": failed_count,
-            "PlayerNickname": player_name,
-            "UID": player_uid,
-            "Credits": "@mr_udit_ff"
-        }
-        return jsonify(summary)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        tasks = [
+            client.post(LOGIN_API, json=acc, timeout=10)
+            for acc in accounts
+        ]
 
-if __name__ == '__main__':
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    app.run(debug=True, use_reloader=False)
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for r in responses:
+        try:
+            data = r.json()
+            token = data.get("token")
+            if token:
+                tokens.append({"token": token})
+        except:
+            pass
+
+    with open("token_ind.json","w") as f:
+        json.dump(tokens,f,indent=2)
+
+    return {
+        "status":"tokens refreshed",
+        "total_tokens": len(tokens)
+    }
